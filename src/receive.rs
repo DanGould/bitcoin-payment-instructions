@@ -8,8 +8,6 @@
 //! This module doesn't actually help you *receive* these funds, but provides a unified way to
 //! parse them.
 
-use crate::split_once;
-
 use bitcoin::secp256k1::SecretKey;
 use bitcoin::Network;
 
@@ -107,32 +105,35 @@ impl ReceiveInstructions {
 		if instructions.len() >= BTC_URI_PFX_LEN
 			&& instructions[..BTC_URI_PFX_LEN].eq_ignore_ascii_case("bitcoin:")
 		{
-			let (_, params) = split_once(&instructions[BTC_URI_PFX_LEN..], '?');
+			let uri = bitcoin_uri::Uri::parse(instructions)
+				.map_err(|_| ParseError::InvalidInstructions("Invalid BIP 321 bitcoin: URI"))?;
+			if uri.unsatisfied_requirements(&["lnr"]).next().is_some() {
+				return Err(ParseError::UnknownRequiredParameter);
+			}
 			let mut methods = Vec::new();
 			let mut description = None;
-			if let Some(params) = params {
-				for param in params.split('&') {
-					let (k, v) = split_once(param, '=');
-					if k.eq_ignore_ascii_case("lnr") || k.eq_ignore_ascii_case("req-lnr") {
-						if let Some(v) = v {
-							match Refund::from_str(v) {
-								Ok(refund) => {
-									if refund.chain() != network.chain_hash() {
-										return Err(ParseError::WrongNetwork);
-									}
-
-									description = Some(refund.description().0.to_string());
-									methods.push(ReceiveMethod::Bolt12Refund(refund));
-								},
-								Err(err) => return Err(ParseError::InvalidBolt12(err)),
+			// `get_all` matches `req-lnr` as well as `lnr`.
+			for param in uri.get_all("lnr") {
+				if let Some(v) = param.decoded_value() {
+					let v = v.map_err(|_| {
+						let err = "A BOLT 12 refund parameter in a BIP 321 bitcoin: URI was not valid percent-encoded UTF-8";
+						ParseError::InvalidInstructions(err)
+					})?;
+					match Refund::from_str(&v) {
+						Ok(refund) => {
+							if refund.chain() != network.chain_hash() {
+								return Err(ParseError::WrongNetwork);
 							}
-						} else {
-							let err = "Missing value for a BOLT 12 refund parameter in a BIP 321 bitcoin: URI";
-							return Err(ParseError::InvalidInstructions(err));
-						}
-					} else if k.len() >= 4 && k[..4].eq_ignore_ascii_case("req-") {
-						return Err(ParseError::UnknownRequiredParameter);
+
+							description = Some(refund.description().0.to_string());
+							methods.push(ReceiveMethod::Bolt12Refund(refund));
+						},
+						Err(err) => return Err(ParseError::InvalidBolt12(err)),
 					}
+				} else {
+					let err =
+						"Missing value for a BOLT 12 refund parameter in a BIP 321 bitcoin: URI";
+					return Err(ParseError::InvalidInstructions(err));
 				}
 			}
 

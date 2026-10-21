@@ -615,31 +615,32 @@ fn split_once(haystack: &str, needle: char) -> (&str, Option<&str>) {
 	haystack.split_once(needle).map(|(a, b)| (a, Some(b))).unwrap_or((haystack, None))
 }
 
-fn un_percent_encode(encoded: &str) -> Result<String, ParseError> {
-	let mut res = Vec::with_capacity(encoded.len());
-	let mut iter = encoded.bytes();
-	let err = "A Proof of Payment URI was not properly %-encoded in a BIP 321 bitcoin: URI";
-	while let Some(b) = iter.next() {
-		if b == b'%' {
-			let high = iter.next().ok_or(ParseError::InvalidInstructions(err))?;
-			let low = iter.next().ok_or(ParseError::InvalidInstructions(err))?;
-			if !high.is_ascii_digit() || !low.is_ascii_digit() {
-				return Err(ParseError::InvalidInstructions(err));
-			}
-			res.push(((high - b'0') << 4) | (low - b'0'));
-		} else {
-			res.push(b);
-		}
-	}
-	String::from_utf8(res).map_err(|_| ParseError::InvalidInstructions(err))
-}
+/// The BIP 321 parameter keys `parse_resolved_instructions` handles, other than `pop`, which is
+/// only understood when the caller supports proof of payment callbacks.
+const UNDERSTOOD_URI_PARAMS: [&str; 10] =
+	["bc", "tb", "ark", "tark", "lightning", "creq", "lno", "amount", "label", "message"];
 
-#[test]
-fn test_un_percent_encode() {
-	assert_eq!(un_percent_encode("%20").unwrap(), " ");
-	assert_eq!(un_percent_encode("42%20 ").unwrap(), "42  ");
-	assert!(un_percent_encode("42%2").is_err());
-	assert!(un_percent_encode("42%2a").is_err());
+fn bitcoin_uri_parse_error(err: bitcoin_uri::Error) -> ParseError {
+	match err {
+		bitcoin_uri::Error::InvalidBodyAddress(e) => ParseError::InvalidOnChain(e),
+		bitcoin_uri::Error::InvalidAmount(_) => {
+			let err = "The amount parameter in a BIP 321 bitcoin: URI was invalid";
+			ParseError::InvalidInstructions(err)
+		},
+		bitcoin_uri::Error::DuplicateParameter(_) => {
+			let err = "A BIP 321 bitcoin: URI repeated an amount, label, message or pop parameter";
+			ParseError::InvalidInstructions(err)
+		},
+		bitcoin_uri::Error::InvalidHrpValue { .. } => {
+			let err = "A bc, tb or bcrt parameter in a BIP 321 bitcoin: URI was not a Segwit address for that network";
+			ParseError::InvalidInstructions(err)
+		},
+		bitcoin_uri::Error::InvalidPercentEncoding { .. } => {
+			let err = "A BIP 321 bitcoin: URI parameter was not properly %-encoded";
+			ParseError::InvalidInstructions(err)
+		},
+		_ => ParseError::InvalidInstructions("Invalid BIP 321 bitcoin: URI"),
+	}
 }
 
 fn parse_resolved_instructions(
@@ -649,20 +650,34 @@ fn parse_resolved_instructions(
 	let (uri_proto, uri_suffix) = split_once(instructions, ':');
 
 	if uri_proto.eq_ignore_ascii_case("bitcoin") {
-		let (body, params) = split_once(uri_suffix.unwrap_or(""), '?');
+		let uri = bitcoin_uri::Uri::parse(instructions).map_err(bitcoin_uri_parse_error)?;
 		let mut methods = Vec::new();
 		let mut description = None;
 		let mut pop_callback = None;
-		if !body.is_empty() {
-			let addr = Address::from_str(body).map_err(ParseError::InvalidOnChain)?;
-			let address = addr.require_network(network).map_err(|_| ParseError::WrongNetwork)?;
+		if let Some(addr) = uri.body() {
+			let address =
+				addr.clone().require_network(network).map_err(|_| ParseError::WrongNetwork)?;
 			methods.push(PaymentMethod::OnChain(address));
 		}
-		if let Some(params) = params {
+		if !uri.params().is_empty() {
+			let mut understood = Vec::from(UNDERSTOOD_URI_PARAMS);
+			if supports_proof_of_payment_callbacks {
+				understood.push("pop");
+			}
+			if uri.unsatisfied_requirements(&understood).next().is_some() {
+				return Err(ParseError::UnknownRequiredParameter);
+			}
 			let mut onchain_amt = None;
 			let mut ark_amt = None;
-			for param in params.split('&') {
-				let (k, v) = split_once(param, '=');
+			for param in uri.params() {
+				// `req-` is only a prefix: a required key is handled exactly like the plain one.
+				let k = param.requirement().unwrap_or(&param.key);
+				let v = param.decoded_value().transpose().map_err(|_| {
+					let err =
+						"A BIP 321 bitcoin: URI parameter was not valid percent-encoded UTF-8";
+					ParseError::InvalidInstructions(err)
+				})?;
+				let v = v.as_deref();
 
 				let mut parse_segwit = |pfx| {
 					if let Some(address_string) = v {
@@ -685,22 +700,14 @@ fn parse_resolved_instructions(
 					}
 					Ok(())
 				};
-				if k.eq_ignore_ascii_case("bc") || k.eq_ignore_ascii_case("req-bc") {
+				if k.eq_ignore_ascii_case("bc") {
 					parse_segwit("bc1")?;
-				} else if k.eq_ignore_ascii_case("tb") || k.eq_ignore_ascii_case("req-tb") {
+				} else if k.eq_ignore_ascii_case("tb") {
 					parse_segwit("tb1")?;
-				} else if k.eq_ignore_ascii_case("ark")
-					|| k.eq_ignore_ascii_case("req-ark")
-					|| k.eq_ignore_ascii_case("tark")
-					|| k.eq_ignore_ascii_case("req-tark")
-				{
+				} else if k.eq_ignore_ascii_case("ark") || k.eq_ignore_ascii_case("tark") {
 					if let Some(address_string) = v {
 						let expected_hrp =
-							if k.eq_ignore_ascii_case("ark") || k.eq_ignore_ascii_case("req-ark") {
-								"ark1"
-							} else {
-								"tark1"
-							};
+							if k.eq_ignore_ascii_case("ark") { "ark1" } else { "tark1" };
 						if address_string.is_char_boundary(expected_hrp.len())
 							&& !address_string[..expected_hrp.len()]
 								.eq_ignore_ascii_case(expected_hrp)
@@ -718,9 +725,7 @@ fn parse_resolved_instructions(
 							"BIP 321 bitcoin: URI contained an ark/tark instruction without a value";
 						return Err(ParseError::InvalidInstructions(err));
 					}
-				} else if k.eq_ignore_ascii_case("lightning")
-					|| k.eq_ignore_ascii_case("req-lightning")
-				{
+				} else if k.eq_ignore_ascii_case("lightning") {
 					if let Some(invoice_string) = v {
 						let invoice = Bolt11Invoice::from_str(invoice_string)
 							.map_err(ParseError::InvalidBolt11)?;
@@ -743,7 +748,7 @@ fn parse_resolved_instructions(
 						let err = "BIP 321 bitcoin: URI contained a lightning (BOLT 11 invoice) instruction without a value";
 						return Err(ParseError::InvalidInstructions(err));
 					}
-				} else if k.eq_ignore_ascii_case("creq") || k.eq_ignore_ascii_case("req-creq") {
+				} else if k.eq_ignore_ascii_case("creq") {
 					if let Some(creq_string) = v {
 						let creq = cashu::CashuPaymentRequest::from_str(creq_string)
 							.map_err(ParseError::InvalidCashu)?;
@@ -755,7 +760,7 @@ fn parse_resolved_instructions(
 						let err = "BIP 321 bitcoin: URI contained a creq (Cashu) instruction without a value";
 						return Err(ParseError::InvalidInstructions(err));
 					}
-				} else if k.eq_ignore_ascii_case("lno") || k.eq_ignore_ascii_case("req-lno") {
+				} else if k.eq_ignore_ascii_case("lno") {
 					if let Some(offer_string) = v {
 						let offer =
 							Offer::from_str(offer_string).map_err(ParseError::InvalidBolt12)?;
@@ -768,23 +773,9 @@ fn parse_resolved_instructions(
 						let err = "BIP 321 bitcoin: URI contained a lightning (BOLT 11 invoice) instruction without a value";
 						return Err(ParseError::InvalidInstructions(err));
 					}
-				} else if k.eq_ignore_ascii_case("amount") || k.eq_ignore_ascii_case("req-amount") {
-					// We handle this in the second loop below
-				} else if k.eq_ignore_ascii_case("label") || k.eq_ignore_ascii_case("req-label") {
-					// We handle this in the second loop below
-				} else if k.eq_ignore_ascii_case("message") || k.eq_ignore_ascii_case("req-message")
-				{
-					// We handle this in the second loop below
-				} else if k.eq_ignore_ascii_case("pop") || k.eq_ignore_ascii_case("req-pop") {
-					if k.eq_ignore_ascii_case("req-pop") && !supports_proof_of_payment_callbacks {
-						return Err(ParseError::UnknownRequiredParameter);
-					}
-					if pop_callback.is_some() {
-						let err = "Multiple proof of payment callbacks appeared in a BIP 321 bitcoin: URI";
-						return Err(ParseError::InvalidInstructions(err));
-					}
+				} else if k.eq_ignore_ascii_case("pop") {
 					if let Some(v) = v {
-						let callback_uri = un_percent_encode(v)?;
+						let callback_uri = v.to_owned();
 						let (proto, _) = split_once(&callback_uri, ':');
 						let proto_isnt_local_app = proto.eq_ignore_ascii_case("javascript")
 							|| proto.eq_ignore_ascii_case("http")
@@ -807,56 +798,20 @@ fn parse_resolved_instructions(
 						let err = "Missing value for a Proof of Payment instruction in a BIP 321 bitcoin: URI";
 						return Err(ParseError::InvalidInstructions(err));
 					}
-				} else if k.is_char_boundary(4) && k[..4].eq_ignore_ascii_case("req-") {
-					return Err(ParseError::UnknownRequiredParameter);
 				}
 			}
-			let mut label = None;
-			let mut message = None;
-			let mut had_amt_param = false;
-			for param in params.split('&') {
-				let (k, v) = split_once(param, '=');
-				if k.eq_ignore_ascii_case("amount") || k.eq_ignore_ascii_case("req-amount") {
-					if let Some(v) = v {
-						if had_amt_param {
-							let err = "Multiple amount parameters in a BIP 321 bitcoin: URI ";
-							return Err(ParseError::InvalidInstructions(err));
-						}
-						had_amt_param = true;
+			// `bitcoin_uri` has already rejected a repeated or malformed amount.
+			if let Some(btc_amt) = uri.amount() {
+				let err = "The amount parameter in a BIP 321 bitcoin: URI was greater than 21M BTC";
+				let amount = Amount::from_sats(btc_amt.to_sat())
+					.map_err(|_| ParseError::InvalidInstructions(err))?;
 
-						let err = "The amount parameter in a BIP 321 bitcoin: URI was invalid";
-						let btc_amt =
-							bitcoin::Amount::from_str_in(v, bitcoin::Denomination::Bitcoin)
-								.map_err(|_| ParseError::InvalidInstructions(err))?;
-
-						let err = "The amount parameter in a BIP 321 bitcoin: URI was greater than 21M BTC";
-						let amount = Amount::from_sats(btc_amt.to_sat())
-							.map_err(|_| ParseError::InvalidInstructions(err))?;
-
-						if onchain_amt.is_some() && onchain_amt != Some(amount) {
-							let err = "On-chain fallbacks from a lightning BOLT 11 invoice and the amount parameter in a BIP 321 bitcoin: URI differed in their amounts";
-							return Err(ParseError::InconsistentInstructions(err));
-						}
-						onchain_amt = Some(amount);
-						ark_amt = Some(amount);
-					} else {
-						let err = "Missing value for an amount parameter in a BIP 321 bitcoin: URI";
-						return Err(ParseError::InvalidInstructions(err));
-					}
-				} else if k.eq_ignore_ascii_case("label") || k.eq_ignore_ascii_case("req-label") {
-					if label.is_some() {
-						let err = "Multiple label parameters in a BIP 321 bitcoin: URI";
-						return Err(ParseError::InvalidInstructions(err));
-					}
-					label = v;
-				} else if k.eq_ignore_ascii_case("message") || k.eq_ignore_ascii_case("req-message")
-				{
-					if message.is_some() {
-						let err = "Multiple message parameters in a BIP 321 bitcoin: URI";
-						return Err(ParseError::InvalidInstructions(err));
-					}
-					message = v;
+				if onchain_amt.is_some() && onchain_amt != Some(amount) {
+					let err = "On-chain fallbacks from a lightning BOLT 11 invoice and the amount parameter in a BIP 321 bitcoin: URI differed in their amounts";
+					return Err(ParseError::InconsistentInstructions(err));
 				}
+				onchain_amt = Some(amount);
+				ark_amt = Some(amount);
 			}
 
 			if methods.is_empty() {
@@ -1549,6 +1504,20 @@ mod tests {
 		assert_eq!(parsed.onchain_payment_amount(), Some(expected_amount));
 		assert_eq!(parsed.recipient_description(), None);
 		assert!(matches!(parsed.methods()[0], PaymentMethod::OnChain(_)));
+	}
+
+	#[tokio::test]
+	async fn parse_bip_21_pop_with_lowercase_hex_escape() {
+		// BIP 321's own proof of payment example escapes the `:` as `%3a`.
+		let uri = "bitcoin:1andreas3batLhQa2FawWjeyjCqyBzypd?amount=50&req-pop=callback%3a";
+		let parsed = PaymentInstructions::parse(uri, Network::Bitcoin, &DummyHrnResolver, true)
+			.await
+			.unwrap();
+		let parsed = match parsed {
+			PaymentInstructions::FixedAmount(parsed) => parsed,
+			_ => panic!(),
+		};
+		assert_eq!(parsed.pop_callback(), Some("callback:"));
 	}
 
 	#[tokio::test]

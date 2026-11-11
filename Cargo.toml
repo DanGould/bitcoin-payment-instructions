@@ -23,7 +23,7 @@ default = ["std"]
 lightning-invoice = { version = "0.34", default-features = false }
 lightning = { version = "0.2.0", default-features = false, features = ["dnssec"] }
 bitcoin = { version = "0.32", default-features = false }
-bitcoin_uri = { git = "https://github.com/payjoin/bitcoin_uri", rev = "680704b84606c41e42c97b3d6b367043e2d5c9e2", default-features = false }
+bitcoin_uri = { version = "0.2.0", default-features = false }
 getrandom = { version = "0.3", default-features = false, optional = true }
 dnssec-prover = { version = "0.6", default-features = false, optional = true, features = ["validation", "std", "tokio"] }
 bitreq = { version = "0.3", default-features = false, optional = true, features = [ "async-https" ] }
